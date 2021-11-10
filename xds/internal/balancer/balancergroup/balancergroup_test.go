@@ -1,5 +1,3 @@
-// +build go1.12
-
 /*
  * Copyright 2019 gRPC authors.
  *
@@ -32,10 +30,9 @@ import (
 	"testing"
 	"time"
 
-	orcapb "github.com/cncf/udpa/go/udpa/data/orca/v1"
+	orcapb "github.com/cncf/xds/go/xds/data/orca/v3"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
-
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/balancer"
 	"google.golang.org/grpc/balancer/roundrobin"
@@ -44,8 +41,8 @@ import (
 	"google.golang.org/grpc/internal/balancer/stub"
 	"google.golang.org/grpc/resolver"
 	"google.golang.org/grpc/xds/internal/balancer/weightedtarget/weightedaggregator"
-	"google.golang.org/grpc/xds/internal/client/load"
 	"google.golang.org/grpc/xds/internal/testutils"
+	"google.golang.org/grpc/xds/internal/xdsclient/load"
 )
 
 var (
@@ -845,7 +842,7 @@ func (s) TestBalancerGroup_locality_caching_not_readd_within_timeout(t *testing.
 	defer replaceDefaultSubBalancerCloseTimeout(time.Second)()
 	_, _, cc, addrToSC := initBalancerGroupForCachingTest(t)
 
-	// The sub-balancer is not re-added withtin timeout. The subconns should be
+	// The sub-balancer is not re-added within timeout. The subconns should be
 	// removed.
 	removeTimeout := time.After(DefaultSubBalancerCloseTimeout)
 	scToRemove := map[balancer.SubConn]int{

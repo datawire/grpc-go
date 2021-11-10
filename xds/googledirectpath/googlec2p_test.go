@@ -1,5 +1,3 @@
-// +build go1.12
-
 /*
  *
  * Copyright 2021 gRPC authors.
@@ -31,8 +29,9 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/internal/xds/env"
 	"google.golang.org/grpc/resolver"
-	"google.golang.org/grpc/xds/internal/client/bootstrap"
 	"google.golang.org/grpc/xds/internal/version"
+	"google.golang.org/grpc/xds/internal/xdsclient"
+	"google.golang.org/grpc/xds/internal/xdsclient/bootstrap"
 	"google.golang.org/protobuf/testing/protocmp"
 	"google.golang.org/protobuf/types/known/structpb"
 )
@@ -130,6 +129,7 @@ func TestBuildNotOnGCE(t *testing.T) {
 }
 
 type testXDSClient struct {
+	xdsclient.XDSClient
 	closed chan struct{}
 }
 
@@ -177,7 +177,7 @@ func TestBuildXDS(t *testing.T) {
 
 			configCh := make(chan *bootstrap.Config, 1)
 			oldNewClient := newClientWithConfig
-			newClientWithConfig = func(config *bootstrap.Config) (xdsClientInterface, error) {
+			newClientWithConfig = func(config *bootstrap.Config) (xdsclient.XDSClient, error) {
 				configCh <- config
 				return tXDSClient, nil
 			}
@@ -194,7 +194,7 @@ func TestBuildXDS(t *testing.T) {
 			}
 
 			wantNode := &v3corepb.Node{
-				Id:                   "C2P",
+				Id:                   id,
 				Metadata:             nil,
 				Locality:             &v3corepb.Locality{Zone: testZone},
 				UserAgentName:        gRPCUserAgentName,

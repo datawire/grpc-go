@@ -34,6 +34,7 @@ import (
 	"google.golang.org/grpc/internal/grpclog"
 	"google.golang.org/grpc/internal/grpcsync"
 	"google.golang.org/grpc/internal/hierarchy"
+	"google.golang.org/grpc/internal/pretty"
 	"google.golang.org/grpc/resolver"
 	"google.golang.org/grpc/serviceconfig"
 	"google.golang.org/grpc/xds/internal/balancer/balancergroup"
@@ -43,12 +44,12 @@ import (
 const Name = "priority_experimental"
 
 func init() {
-	balancer.Register(priorityBB{})
+	balancer.Register(bb{})
 }
 
-type priorityBB struct{}
+type bb struct{}
 
-func (priorityBB) Build(cc balancer.ClientConn, bOpts balancer.BuildOptions) balancer.Balancer {
+func (bb) Build(cc balancer.ClientConn, bOpts balancer.BuildOptions) balancer.Balancer {
 	b := &priorityBalancer{
 		cc:                       cc,
 		done:                     grpcsync.NewEvent(),
@@ -65,11 +66,11 @@ func (priorityBB) Build(cc balancer.ClientConn, bOpts balancer.BuildOptions) bal
 	return b
 }
 
-func (b priorityBB) ParseConfig(s json.RawMessage) (serviceconfig.LoadBalancingConfig, error) {
+func (b bb) ParseConfig(s json.RawMessage) (serviceconfig.LoadBalancingConfig, error) {
 	return parseConfig(s)
 }
 
-func (priorityBB) Name() string {
+func (bb) Name() string {
 	return Name
 }
 
@@ -108,6 +109,7 @@ type priorityBalancer struct {
 }
 
 func (b *priorityBalancer) UpdateClientConnState(s balancer.ClientConnState) error {
+	b.logger.Infof("Received update from resolver, balancer config: %+v", pretty.ToJSON(s.BalancerConfig))
 	newConfig, ok := s.BalancerConfig.(*LBConfig)
 	if !ok {
 		return fmt.Errorf("unexpected balancer config with type: %T", s.BalancerConfig)
@@ -197,6 +199,10 @@ func (b *priorityBalancer) Close() {
 	// update, it will be dropped.
 	b.childInUse = ""
 	b.stopPriorityInitTimer()
+}
+
+func (b *priorityBalancer) ExitIdle() {
+	b.bg.ExitIdle()
 }
 
 // stopPriorityInitTimer stops the priorityInitTimer if it's not nil, and set it

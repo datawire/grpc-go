@@ -1,4 +1,4 @@
-// +build go1.12
+//go:build !386
 // +build !386
 
 /*
@@ -40,10 +40,8 @@ import (
 	"google.golang.org/grpc/internal/grpctest"
 	"google.golang.org/grpc/internal/testutils"
 	"google.golang.org/grpc/internal/xds"
-	"google.golang.org/grpc/internal/xds/env"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
-	"google.golang.org/grpc/xds/internal/httpfilter"
 	xtestutils "google.golang.org/grpc/xds/internal/testutils"
 	"google.golang.org/grpc/xds/internal/testutils/e2e"
 	"google.golang.org/protobuf/types/known/wrapperspb"
@@ -55,10 +53,12 @@ import (
 	tpb "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	testpb "google.golang.org/grpc/test/grpc_testing"
 
-	_ "google.golang.org/grpc/xds/internal/balancer"  // Register the balancers.
-	_ "google.golang.org/grpc/xds/internal/client/v3" // Register the v3 xDS API client.
-	_ "google.golang.org/grpc/xds/internal/resolver"  // Register the xds_resolver.
+	_ "google.golang.org/grpc/xds/internal/balancer"     // Register the balancers.
+	_ "google.golang.org/grpc/xds/internal/resolver"     // Register the xds_resolver.
+	_ "google.golang.org/grpc/xds/internal/xdsclient/v3" // Register the v3 xDS API client.
 )
+
+const defaultTestTimeout = 10 * time.Second
 
 type s struct {
 	grpctest.Tester
@@ -138,13 +138,6 @@ func clientSetup(t *testing.T) (*e2e.ManagementServer, string, uint32, func()) {
 		bootstrapCleanup()
 		server.Stop()
 	}
-}
-
-func init() {
-	env.FaultInjectionSupport = true
-	// Manually register to avoid a race between this init and the one that
-	// check the env var to register the fault injection filter.
-	httpfilter.Register(builder{})
 }
 
 func (s) TestFaultInjection_Unary(t *testing.T) {
@@ -529,7 +522,9 @@ func (s) TestFaultInjection_Unary(t *testing.T) {
 			resources.Listeners[0].ApiListener.ApiListener = hcmAny
 			resources.Listeners[0].FilterChains[0].Filters[0].ConfigType = &v3listenerpb.Filter_TypedConfig{TypedConfig: hcmAny}
 
-			if err := fs.Update(resources); err != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+			defer cancel()
+			if err := fs.Update(ctx, resources); err != nil {
 				t.Fatal(err)
 			}
 
@@ -602,7 +597,9 @@ func (s) TestFaultInjection_MaxActiveFaults(t *testing.T) {
 	resources.Listeners[0].ApiListener.ApiListener = hcmAny
 	resources.Listeners[0].FilterChains[0].Filters[0].ConfigType = &v3listenerpb.Filter_TypedConfig{TypedConfig: hcmAny}
 
-	if err := fs.Update(resources); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+	if err := fs.Update(ctx, resources); err != nil {
 		t.Fatal(err)
 	}
 
@@ -614,10 +611,8 @@ func (s) TestFaultInjection_MaxActiveFaults(t *testing.T) {
 	defer cc.Close()
 
 	client := testpb.NewTestServiceClient(cc)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
 
-	streams := make(chan testpb.TestService_FullDuplexCallClient)
+	streams := make(chan testpb.TestService_FullDuplexCallClient, 5) // startStream() is called 5 times
 	startStream := func() {
 		str, err := client.FullDuplexCall(ctx)
 		if err != nil {
@@ -629,7 +624,7 @@ func (s) TestFaultInjection_MaxActiveFaults(t *testing.T) {
 		str := <-streams
 		str.CloseSend()
 		if _, err := str.Recv(); err != io.EOF {
-			t.Fatal("stream error:", err)
+			t.Error("stream error:", err)
 		}
 	}
 	releaseStream := func() {

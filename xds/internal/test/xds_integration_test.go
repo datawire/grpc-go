@@ -1,4 +1,4 @@
-// +build go1.12
+//go:build !386
 // +build !386
 
 /*
@@ -29,18 +29,18 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
-	"log"
 	"os"
 	"path"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/internal/grpctest"
-	"google.golang.org/grpc/internal/leakcheck"
-	"google.golang.org/grpc/internal/xds/env"
+	"google.golang.org/grpc/resolver"
 	"google.golang.org/grpc/testdata"
+	"google.golang.org/grpc/xds"
 	"google.golang.org/grpc/xds/internal/testutils/e2e"
 
 	xdsinternal "google.golang.org/grpc/internal/xds"
@@ -68,35 +68,8 @@ func (*testService) EmptyCall(context.Context, *testpb.Empty) (*testpb.Empty, er
 	return &testpb.Empty{}, nil
 }
 
-var (
-	// Globals corresponding to the single instance of the xDS management server
-	// which is spawned for all the tests in this package.
-	managementServer *e2e.ManagementServer
-	xdsClientNodeID  string
-)
-
-// TestMain sets up an xDS management server, runs all tests, and stops the
-// management server.
-func TestMain(m *testing.M) {
-	// The management server is started and stopped from here, but the leakcheck
-	// runs after every individual test. So, we need to skip the goroutine which
-	// spawns the management server and is blocked on the call to `Serve()`.
-	leakcheck.RegisterIgnoreGoroutine("e2e.StartManagementServer")
-
-	// Remove this once https://github.com/envoyproxy/go-control-plane/pull/430
-	// is merged. For more information about this goroutine leak, see:
-	// https://github.com/envoyproxy/go-control-plane/issues/429.
-	leakcheck.RegisterIgnoreGoroutine("(*server).StreamHandler")
-
-	cancel, err := setupManagementServer()
-	if err != nil {
-		log.Printf("setupManagementServer() failed: %v", err)
-		os.Exit(1)
-	}
-
-	code := m.Run()
-	cancel()
-	os.Exit(code)
+func (*testService) UnaryCall(context.Context, *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
+	return &testpb.SimpleResponse{}, nil
 }
 
 func createTmpFile(src, dst string) error {
@@ -160,34 +133,41 @@ func createClientTLSCredentials(t *testing.T) credentials.TransportCredentials {
 // setupManagement server performs the following:
 // - spin up an xDS management server on a local port
 // - set up certificates for consumption by the file_watcher plugin
-// - sets up the global variables which refer to this management server and the
-//   nodeID to be used when talking to this management server.
+// - creates a bootstrap file in a temporary location
+// - creates an xDS resolver using the above bootstrap contents
 //
-// Returns a function to be invoked by the caller to stop the management server.
-func setupManagementServer() (func(), error) {
-	// Turn on the env var protection for client-side security.
-	origClientSideSecurityEnvVar := env.ClientSideSecuritySupport
-	env.ClientSideSecuritySupport = true
+// Returns the following:
+// - management server
+// - nodeID to be used by the client when connecting to the management server
+// - bootstrap contents to be used by the client
+// - xDS resolver builder to be used by the client
+// - a cleanup function to be invoked at the end of the test
+func setupManagementServer(t *testing.T) (*e2e.ManagementServer, string, []byte, resolver.Builder, func()) {
+	t.Helper()
 
 	// Spin up an xDS management server on a local port.
-	var err error
-	managementServer, err = e2e.StartManagementServer()
+	server, err := e2e.StartManagementServer()
 	if err != nil {
-		return nil, err
+		t.Fatalf("Failed to spin up the xDS management server: %v", err)
 	}
+	defer func() {
+		if err != nil {
+			server.Stop()
+		}
+	}()
 
 	// Create a directory to hold certs and key files used on the server side.
 	serverDir, err := createTmpDirWithFiles("testServerSideXDS*", "x509/server1_cert.pem", "x509/server1_key.pem", "x509/client_ca_cert.pem")
 	if err != nil {
-		managementServer.Stop()
-		return nil, err
+		server.Stop()
+		t.Fatal(err)
 	}
 
 	// Create a directory to hold certs and key files used on the client side.
 	clientDir, err := createTmpDirWithFiles("testClientSideXDS*", "x509/client1_cert.pem", "x509/client1_key.pem", "x509/server_ca_cert.pem")
 	if err != nil {
-		managementServer.Stop()
-		return nil, err
+		server.Stop()
+		t.Fatal(err)
 	}
 
 	// Create certificate providers section of the bootstrap config with entries
@@ -198,22 +178,23 @@ func setupManagementServer() (func(), error) {
 	}
 
 	// Create a bootstrap file in a temporary directory.
-	xdsClientNodeID = uuid.New().String()
-	bootstrapCleanup, err := xdsinternal.SetupBootstrapFile(xdsinternal.BootstrapOptions{
+	nodeID := uuid.New().String()
+	bootstrapContents, err := xdsinternal.BootstrapContents(xdsinternal.BootstrapOptions{
 		Version:                            xdsinternal.TransportV3,
-		NodeID:                             xdsClientNodeID,
-		ServerURI:                          managementServer.Address,
+		NodeID:                             nodeID,
+		ServerURI:                          server.Address,
 		CertificateProviders:               cpc,
 		ServerListenerResourceNameTemplate: e2e.ServerListenerResourceNameTemplate,
 	})
 	if err != nil {
-		managementServer.Stop()
-		return nil, err
+		server.Stop()
+		t.Fatalf("Failed to create bootstrap file: %v", err)
+	}
+	resolver, err := xds.NewXDSResolverWithConfigForTesting(bootstrapContents)
+	if err != nil {
+		server.Stop()
+		t.Fatalf("Failed to create xDS resolver for testing: %v", err)
 	}
 
-	return func() {
-		managementServer.Stop()
-		bootstrapCleanup()
-		env.ClientSideSecuritySupport = origClientSideSecurityEnvVar
-	}, nil
+	return server, nodeID, bootstrapContents, resolver, func() { server.Stop() }
 }

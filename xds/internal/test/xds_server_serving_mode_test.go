@@ -1,4 +1,4 @@
-// +build go1.13
+//go:build !386
 // +build !386
 
 /*
@@ -26,67 +26,139 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"sync"
 	"testing"
+	"time"
 
 	v3listenerpb "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
-
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
 	xdscreds "google.golang.org/grpc/credentials/xds"
-	"google.golang.org/grpc/internal/testutils"
 	testpb "google.golang.org/grpc/test/grpc_testing"
 	"google.golang.org/grpc/xds"
 	xdstestutils "google.golang.org/grpc/xds/internal/testutils"
 	"google.golang.org/grpc/xds/internal/testutils/e2e"
 )
 
-// A convenience typed used to keep track of mode changes on multiple listeners.
-type modeTracker struct {
-	mu       sync.Mutex
-	modes    map[string]xds.ServingMode
-	updateCh *testutils.Channel
-}
+// TestServerSideXDS_RedundantUpdateSuppression tests the scenario where the
+// control plane sends the same resource update. It verifies that the mode
+// change callback is not invoked and client connections to the server are not
+// recycled.
+func (s) TestServerSideXDS_RedundantUpdateSuppression(t *testing.T) {
+	managementServer, nodeID, bootstrapContents, _, cleanup := setupManagementServer(t)
+	defer cleanup()
 
-func newModeTracker() *modeTracker {
-	return &modeTracker{
-		modes:    make(map[string]xds.ServingMode),
-		updateCh: testutils.NewChannel(),
-	}
-}
-
-func (mt *modeTracker) updateMode(ctx context.Context, addr net.Addr, mode xds.ServingMode) {
-	mt.mu.Lock()
-	defer mt.mu.Unlock()
-
-	mt.modes[addr.String()] = mode
-	// Sometimes we could get state updates which are not expected by the test.
-	// Using `Send()` here would block in that case and cause the whole test to
-	// hang and will eventually only timeout when the `-timeout` passed to `go
-	// test` elapses. Using `SendContext()` here instead fails the test within a
-	// reasonable timeout.
-	mt.updateCh.SendContext(ctx, nil)
-}
-
-func (mt *modeTracker) getMode(addr net.Addr) xds.ServingMode {
-	mt.mu.Lock()
-	defer mt.mu.Unlock()
-	return mt.modes[addr.String()]
-}
-
-func (mt *modeTracker) waitForUpdate(ctx context.Context) error {
-	_, err := mt.updateCh.Receive(ctx)
+	creds, err := xdscreds.NewServerCredentials(xdscreds.ServerOptions{FallbackCreds: insecure.NewCredentials()})
 	if err != nil {
-		return fmt.Errorf("error when waiting for a mode change update: %v", err)
+		t.Fatal(err)
 	}
-	return nil
+	lis, err := xdstestutils.LocalTCPListener()
+	if err != nil {
+		t.Fatalf("testutils.LocalTCPListener() failed: %v", err)
+	}
+	updateCh := make(chan connectivity.ServingMode, 1)
+
+	// Create a server option to get notified about serving mode changes.
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+	modeChangeOpt := xds.ServingModeCallback(func(addr net.Addr, args xds.ServingModeChangeArgs) {
+		t.Logf("serving mode for listener %q changed to %q, err: %v", addr.String(), args.Mode, args.Err)
+		updateCh <- args.Mode
+	})
+
+	// Initialize an xDS-enabled gRPC server and register the stubServer on it.
+	server := xds.NewGRPCServer(grpc.Creds(creds), modeChangeOpt, xds.BootstrapContentsForTesting(bootstrapContents))
+	defer server.Stop()
+	testpb.RegisterTestServiceServer(server, &testService{})
+
+	// Setup the management server to respond with the listener resources.
+	host, port, err := hostPortFromListener(lis)
+	if err != nil {
+		t.Fatalf("failed to retrieve host and port of server: %v", err)
+	}
+	listener := e2e.DefaultServerListener(host, port, e2e.SecurityLevelNone)
+	resources := e2e.UpdateOptions{
+		NodeID:    nodeID,
+		Listeners: []*v3listenerpb.Listener{listener},
+	}
+	if err := managementServer.Update(ctx, resources); err != nil {
+		t.Fatal(err)
+	}
+
+	go func() {
+		if err := server.Serve(lis); err != nil {
+			t.Errorf("Serve() failed: %v", err)
+		}
+	}()
+
+	// Wait for the listener to move to "serving" mode.
+	select {
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for a mode change update: %v", err)
+	case mode := <-updateCh:
+		if mode != connectivity.ServingModeServing {
+			t.Fatalf("listener received new mode %v, want %v", mode, connectivity.ServingModeServing)
+		}
+	}
+
+	// Create a ClientConn and make a successful RPCs.
+	cc, err := grpc.Dial(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("failed to dial local test server: %v", err)
+	}
+	defer cc.Close()
+	waitForSuccessfulRPC(ctx, t, cc)
+
+	// Start a goroutine to make sure that we do not see any connectivity state
+	// changes on the client connection. If redundant updates are not
+	// suppressed, server will recycle client connections.
+	errCh := make(chan error, 1)
+	go func() {
+		if cc.WaitForStateChange(ctx, connectivity.Ready) {
+			errCh <- fmt.Errorf("unexpected connectivity state change {%s --> %s} on the client connection", connectivity.Ready, cc.GetState())
+			return
+		}
+		errCh <- nil
+	}()
+
+	// Update the management server with the same listener resource. This will
+	// update the resource version though, and should result in a the management
+	// server sending the same resource to the xDS-enabled gRPC server.
+	if err := managementServer.Update(ctx, e2e.UpdateOptions{
+		NodeID:    nodeID,
+		Listeners: []*v3listenerpb.Listener{listener},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Since redundant resource updates are suppressed, we should not see the
+	// mode change callback being invoked.
+	sCtx, sCancel := context.WithTimeout(ctx, defaultTestShortTimeout)
+	defer sCancel()
+	select {
+	case <-sCtx.Done():
+	case mode := <-updateCh:
+		t.Fatalf("unexpected mode change callback with new mode %v", mode)
+	}
+
+	// Make sure RPCs continue to succeed.
+	waitForSuccessfulRPC(ctx, t, cc)
+
+	// Cancel the context to ensure that the WaitForStateChange call exits early
+	// and returns false.
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatal(err)
+	}
 }
 
 // TestServerSideXDS_ServingModeChanges tests the serving mode functionality in
 // xDS enabled gRPC servers. It verifies that appropriate mode changes happen in
 // the server, and also verifies behavior of clientConns under these modes.
 func (s) TestServerSideXDS_ServingModeChanges(t *testing.T) {
+	managementServer, nodeID, bootstrapContents, _, cleanup := setupManagementServer(t)
+	defer cleanup()
+
 	// Configure xDS credentials to be used on the server-side.
 	creds, err := xdscreds.NewServerCredentials(xdscreds.ServerOptions{
 		FallbackCreds: insecure.NewCredentials(),
@@ -94,20 +166,6 @@ func (s) TestServerSideXDS_ServingModeChanges(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	// Create a server option to get notified about serving mode changes.
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
-	defer cancel()
-	modeTracker := newModeTracker()
-	modeChangeOpt := xds.ServingModeCallback(func(addr net.Addr, args xds.ServingModeChangeArgs) {
-		t.Logf("serving mode for listener %q changed to %q, err: %v", addr.String(), args.Mode, args.Err)
-		modeTracker.updateMode(ctx, addr, args.Mode)
-	})
-
-	// Initialize an xDS-enabled gRPC server and register the stubServer on it.
-	server := xds.NewGRPCServer(grpc.Creds(creds), modeChangeOpt)
-	defer server.Stop()
-	testpb.RegisterTestServiceServer(server, &testService{})
 
 	// Create two local listeners and pass it to Serve().
 	lis1, err := xdstestutils.LocalTCPListener()
@@ -118,6 +176,31 @@ func (s) TestServerSideXDS_ServingModeChanges(t *testing.T) {
 	if err != nil {
 		t.Fatalf("testutils.LocalTCPListener() failed: %v", err)
 	}
+
+	// Create a couple of channels on which mode updates will be pushed.
+	updateCh1 := make(chan connectivity.ServingMode, 1)
+	updateCh2 := make(chan connectivity.ServingMode, 1)
+
+	// Create a server option to get notified about serving mode changes, and
+	// push the updated mode on the channels created above.
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+	modeChangeOpt := xds.ServingModeCallback(func(addr net.Addr, args xds.ServingModeChangeArgs) {
+		t.Logf("serving mode for listener %q changed to %q, err: %v", addr.String(), args.Mode, args.Err)
+		switch addr.String() {
+		case lis1.Addr().String():
+			updateCh1 <- args.Mode
+		case lis2.Addr().String():
+			updateCh2 <- args.Mode
+		default:
+			t.Logf("serving mode callback invoked for unknown listener address: %q", addr.String())
+		}
+	})
+
+	// Initialize an xDS-enabled gRPC server and register the stubServer on it.
+	server := xds.NewGRPCServer(grpc.Creds(creds), modeChangeOpt, xds.BootstrapContentsForTesting(bootstrapContents))
+	defer server.Stop()
+	testpb.RegisterTestServiceServer(server, &testService{})
 
 	// Setup the management server to respond with server-side Listener
 	// resources for both listeners.
@@ -132,10 +215,10 @@ func (s) TestServerSideXDS_ServingModeChanges(t *testing.T) {
 	}
 	listener2 := e2e.DefaultServerListener(host2, port2, e2e.SecurityLevelNone)
 	resources := e2e.UpdateOptions{
-		NodeID:    xdsClientNodeID,
+		NodeID:    nodeID,
 		Listeners: []*v3listenerpb.Listener{listener1, listener2},
 	}
-	if err := managementServer.Update(resources); err != nil {
+	if err := managementServer.Update(ctx, resources); err != nil {
 		t.Fatal(err)
 	}
 
@@ -151,132 +234,155 @@ func (s) TestServerSideXDS_ServingModeChanges(t *testing.T) {
 	}()
 
 	// Wait for both listeners to move to "serving" mode.
-	if err := waitForModeChange(ctx, modeTracker, lis1.Addr(), xds.ServingModeServing); err != nil {
-		t.Fatal(err)
+	select {
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for a mode change update: %v", err)
+	case mode := <-updateCh1:
+		if mode != connectivity.ServingModeServing {
+			t.Errorf("listener received new mode %v, want %v", mode, connectivity.ServingModeServing)
+		}
 	}
-	if err := waitForModeChange(ctx, modeTracker, lis2.Addr(), xds.ServingModeServing); err != nil {
-		t.Fatal(err)
+	select {
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for a mode change update: %v", err)
+	case mode := <-updateCh2:
+		if mode != connectivity.ServingModeServing {
+			t.Errorf("listener received new mode %v, want %v", mode, connectivity.ServingModeServing)
+		}
 	}
 
 	// Create a ClientConn to the first listener and make a successful RPCs.
-	cc1, err := grpc.DialContext(ctx, lis1.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	cc1, err := grpc.Dial(lis1.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Fatalf("failed to dial local test server: %v", err)
 	}
 	defer cc1.Close()
-
-	client1 := testpb.NewTestServiceClient(cc1)
-	if _, err := client1.EmptyCall(ctx, &testpb.Empty{}, grpc.WaitForReady(true)); err != nil {
-		t.Fatalf("rpc EmptyCall() failed: %v", err)
-	}
+	waitForSuccessfulRPC(ctx, t, cc1)
 
 	// Create a ClientConn to the second listener and make a successful RPCs.
-	cc2, err := grpc.DialContext(ctx, lis2.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	cc2, err := grpc.Dial(lis2.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Fatalf("failed to dial local test server: %v", err)
 	}
 	defer cc2.Close()
+	waitForSuccessfulRPC(ctx, t, cc2)
 
-	client2 := testpb.NewTestServiceClient(cc2)
-	if _, err := client2.EmptyCall(ctx, &testpb.Empty{}, grpc.WaitForReady(true)); err != nil {
-		t.Fatalf("rpc EmptyCall() failed: %v", err)
-	}
-
-	// Update the management server to remove the second listener resource. This should
-	// push the only the second listener into "not-serving" mode.
-	if err := managementServer.Update(e2e.UpdateOptions{
-		NodeID:    xdsClientNodeID,
+	// Update the management server to remove the second listener resource. This
+	// should push only the second listener into "not-serving" mode.
+	if err := managementServer.Update(ctx, e2e.UpdateOptions{
+		NodeID:    nodeID,
 		Listeners: []*v3listenerpb.Listener{listener1},
 	}); err != nil {
 		t.Error(err)
 	}
-	if err := waitForModeChange(ctx, modeTracker, lis2.Addr(), xds.ServingModeNotServing); err != nil {
-		t.Fatal(err)
-	}
 
-	// Make sure cc1 is still in READY state, while cc2 has moved out of READY.
-	if s := cc1.GetState(); s != connectivity.Ready {
-		t.Fatalf("clientConn1 state is %s, want %s", s, connectivity.Ready)
-	}
-	if !cc2.WaitForStateChange(ctx, connectivity.Ready) {
-		t.Fatal("clientConn2 failed to move out of READY")
+	// Wait for lis2 to move to "not-serving" mode.
+	select {
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for a mode change update: %v", err)
+	case mode := <-updateCh2:
+		if mode != connectivity.ServingModeNotServing {
+			t.Errorf("listener received new mode %v, want %v", mode, connectivity.ServingModeNotServing)
+		}
 	}
 
 	// Make sure RPCs succeed on cc1 and fail on cc2.
-	if _, err := client1.EmptyCall(ctx, &testpb.Empty{}, grpc.WaitForReady(true)); err != nil {
-		t.Fatalf("rpc EmptyCall() failed: %v", err)
-	}
-	if _, err := client2.EmptyCall(ctx, &testpb.Empty{}); err == nil {
-		t.Fatal("rpc EmptyCall() succeeded when expected to fail")
-	}
+	waitForSuccessfulRPC(ctx, t, cc1)
+	waitForFailedRPC(ctx, t, cc2)
 
 	// Update the management server to remove the first listener resource as
 	// well. This should push the first listener into "not-serving" mode. Second
 	// listener is already in "not-serving" mode.
-	if err := managementServer.Update(e2e.UpdateOptions{
-		NodeID:    xdsClientNodeID,
+	if err := managementServer.Update(ctx, e2e.UpdateOptions{
+		NodeID:    nodeID,
 		Listeners: []*v3listenerpb.Listener{},
 	}); err != nil {
 		t.Error(err)
 	}
-	if err := waitForModeChange(ctx, modeTracker, lis1.Addr(), xds.ServingModeNotServing); err != nil {
-		t.Fatal(err)
-	}
 
-	// Make sure cc1 has moved out of READY.
-	if !cc1.WaitForStateChange(ctx, connectivity.Ready) {
-		t.Fatal("clientConn1 failed to move out of READY")
+	// Wait for lis1 to move to "not-serving" mode. lis2 was already removed
+	// from the xdsclient's resource cache. So, lis2's callback will not be
+	// invoked this time around.
+	select {
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for a mode change update: %v", err)
+	case mode := <-updateCh1:
+		if mode != connectivity.ServingModeNotServing {
+			t.Errorf("listener received new mode %v, want %v", mode, connectivity.ServingModeNotServing)
+		}
 	}
 
 	// Make sure RPCs fail on both.
-	if _, err := client1.EmptyCall(ctx, &testpb.Empty{}); err == nil {
-		t.Fatal("rpc EmptyCall() succeeded when expected to fail")
-	}
-	if _, err := client2.EmptyCall(ctx, &testpb.Empty{}); err == nil {
-		t.Fatal("rpc EmptyCall() succeeded when expected to fail")
-	}
+	waitForFailedRPC(ctx, t, cc1)
+	waitForFailedRPC(ctx, t, cc2)
 
 	// Make sure new connection attempts to "not-serving" servers fail. We use a
 	// short timeout since we expect this to fail.
 	sCtx, sCancel := context.WithTimeout(ctx, defaultTestShortTimeout)
 	defer sCancel()
-	_, err = grpc.DialContext(sCtx, lis1.Addr().String(), grpc.WithBlock(), grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err == nil {
+	if _, err := grpc.DialContext(sCtx, lis1.Addr().String(), grpc.WithBlock(), grpc.WithTransportCredentials(insecure.NewCredentials())); err == nil {
 		t.Fatal("successfully created clientConn to a server in \"not-serving\" state")
 	}
 
 	// Update the management server with both listener resources.
-	if err := managementServer.Update(e2e.UpdateOptions{
-		NodeID:    xdsClientNodeID,
+	if err := managementServer.Update(ctx, e2e.UpdateOptions{
+		NodeID:    nodeID,
 		Listeners: []*v3listenerpb.Listener{listener1, listener2},
 	}); err != nil {
 		t.Error(err)
 	}
 
 	// Wait for both listeners to move to "serving" mode.
-	if err := waitForModeChange(ctx, modeTracker, lis1.Addr(), xds.ServingModeServing); err != nil {
-		t.Fatal(err)
+	select {
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for a mode change update: %v", err)
+	case mode := <-updateCh1:
+		if mode != connectivity.ServingModeServing {
+			t.Errorf("listener received new mode %v, want %v", mode, connectivity.ServingModeServing)
+		}
 	}
-	if err := waitForModeChange(ctx, modeTracker, lis2.Addr(), xds.ServingModeServing); err != nil {
-		t.Fatal(err)
+	select {
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for a mode change update: %v", err)
+	case mode := <-updateCh2:
+		if mode != connectivity.ServingModeServing {
+			t.Errorf("listener received new mode %v, want %v", mode, connectivity.ServingModeServing)
+		}
 	}
 
 	// The clientConns created earlier should be able to make RPCs now.
-	if _, err := client1.EmptyCall(ctx, &testpb.Empty{}, grpc.WaitForReady(true)); err != nil {
-		t.Fatalf("rpc EmptyCall() failed: %v", err)
-	}
-	if _, err := client2.EmptyCall(ctx, &testpb.Empty{}, grpc.WaitForReady(true)); err != nil {
+	waitForSuccessfulRPC(ctx, t, cc1)
+	waitForSuccessfulRPC(ctx, t, cc2)
+}
+
+func waitForSuccessfulRPC(ctx context.Context, t *testing.T, cc *grpc.ClientConn) {
+	t.Helper()
+
+	c := testpb.NewTestServiceClient(cc)
+	if _, err := c.EmptyCall(ctx, &testpb.Empty{}, grpc.WaitForReady(true)); err != nil {
 		t.Fatalf("rpc EmptyCall() failed: %v", err)
 	}
 }
 
-func waitForModeChange(ctx context.Context, modeTracker *modeTracker, addr net.Addr, wantMode xds.ServingMode) error {
+func waitForFailedRPC(ctx context.Context, t *testing.T, cc *grpc.ClientConn) {
+	t.Helper()
+
+	// Attempt one RPC before waiting for the ticker to expire.
+	c := testpb.NewTestServiceClient(cc)
+	if _, err := c.EmptyCall(ctx, &testpb.Empty{}); err != nil {
+		return
+	}
+
+	ticker := time.NewTimer(1 * time.Second)
+	defer ticker.Stop()
 	for {
-		if gotMode := modeTracker.getMode(addr); gotMode == wantMode {
-			return nil
-		}
-		if err := modeTracker.waitForUpdate(ctx); err != nil {
-			return err
+		select {
+		case <-ctx.Done():
+			t.Fatalf("failure when waiting for RPCs to fail: %v", ctx.Err())
+		case <-ticker.C:
+			if _, err := c.EmptyCall(ctx, &testpb.Empty{}); err != nil {
+				return
+			}
 		}
 	}
 }

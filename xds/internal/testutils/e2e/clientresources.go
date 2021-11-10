@@ -20,6 +20,8 @@ package e2e
 
 import (
 	"fmt"
+	"net"
+	"strconv"
 
 	"github.com/envoyproxy/go-control-plane/pkg/wellknown"
 	"github.com/golang/protobuf/proto"
@@ -91,9 +93,12 @@ func DefaultClientResources(params ResourceParams) UpdateOptions {
 		Listeners: []*v3listenerpb.Listener{DefaultClientListener(params.DialTarget, routeConfigName)},
 		Routes:    []*v3routepb.RouteConfiguration{DefaultRouteConfig(routeConfigName, params.DialTarget, clusterName)},
 		Clusters:  []*v3clusterpb.Cluster{DefaultCluster(clusterName, endpointsName, params.SecLevel)},
-		Endpoints: []*v3endpointpb.ClusterLoadAssignment{DefaultEndpoint(endpointsName, params.Host, params.Port)},
+		Endpoints: []*v3endpointpb.ClusterLoadAssignment{DefaultEndpoint(endpointsName, params.Host, []uint32{params.Port})},
 	}
 }
+
+// RouterHTTPFilter is the HTTP Filter configuration for the Router filter.
+var RouterHTTPFilter = HTTPFilter("router", &v3routerpb.Router{})
 
 // DefaultClientListener returns a basic xds Listener resource to be used on
 // the client side.
@@ -160,7 +165,7 @@ func DefaultServerListener(host string, port uint32, secLevel SecurityLevel) *v3
 		}
 	}
 	return &v3listenerpb.Listener{
-		Name: fmt.Sprintf(ServerListenerResourceNameTemplate, fmt.Sprintf("%s:%d", host, port)),
+		Name: fmt.Sprintf(ServerListenerResourceNameTemplate, net.JoinHostPort(host, strconv.Itoa(int(port)))),
 		Address: &v3corepb.Address{
 			Address: &v3corepb.Address_SocketAddress{
 				SocketAddress: &v3corepb.SocketAddress{
@@ -197,7 +202,24 @@ func DefaultServerListener(host string, port uint32, secLevel SecurityLevel) *v3
 					{
 						Name: "filter-1",
 						ConfigType: &v3listenerpb.Filter_TypedConfig{
-							TypedConfig: testutils.MarshalAny(&v3httppb.HttpConnectionManager{}),
+							TypedConfig: testutils.MarshalAny(&v3httppb.HttpConnectionManager{
+								RouteSpecifier: &v3httppb.HttpConnectionManager_RouteConfig{
+									RouteConfig: &v3routepb.RouteConfiguration{
+										Name: "routeName",
+										VirtualHosts: []*v3routepb.VirtualHost{{
+											// This "*" string matches on any incoming authority. This is to ensure any
+											// incoming RPC matches to Route_NonForwardingAction and will proceed as
+											// normal.
+											Domains: []string{"*"},
+											Routes: []*v3routepb.Route{{
+												Match: &v3routepb.RouteMatch{
+													PathSpecifier: &v3routepb.RouteMatch_Prefix{Prefix: "/"},
+												},
+												Action: &v3routepb.Route_NonForwardingAction{},
+											}}}}},
+								},
+								HttpFilters: []*v3httppb.HttpFilter{RouterHTTPFilter},
+							}),
 						},
 					},
 				},
@@ -228,7 +250,24 @@ func DefaultServerListener(host string, port uint32, secLevel SecurityLevel) *v3
 					{
 						Name: "filter-1",
 						ConfigType: &v3listenerpb.Filter_TypedConfig{
-							TypedConfig: testutils.MarshalAny(&v3httppb.HttpConnectionManager{}),
+							TypedConfig: testutils.MarshalAny(&v3httppb.HttpConnectionManager{
+								RouteSpecifier: &v3httppb.HttpConnectionManager_RouteConfig{
+									RouteConfig: &v3routepb.RouteConfiguration{
+										Name: "routeName",
+										VirtualHosts: []*v3routepb.VirtualHost{{
+											// This "*" string matches on any incoming authority. This is to ensure any
+											// incoming RPC matches to Route_NonForwardingAction and will proceed as
+											// normal.
+											Domains: []string{"*"},
+											Routes: []*v3routepb.Route{{
+												Match: &v3routepb.RouteMatch{
+													PathSpecifier: &v3routepb.RouteMatch_Prefix{Prefix: "/"},
+												},
+												Action: &v3routepb.Route_NonForwardingAction{},
+											}}}}},
+								},
+								HttpFilters: []*v3httppb.HttpFilter{RouterHTTPFilter},
+							}),
 						},
 					},
 				},
@@ -319,21 +358,25 @@ func DefaultCluster(clusterName, edsServiceName string, secLevel SecurityLevel) 
 }
 
 // DefaultEndpoint returns a basic xds Endpoint resource.
-func DefaultEndpoint(clusterName string, host string, port uint32) *v3endpointpb.ClusterLoadAssignment {
+func DefaultEndpoint(clusterName string, host string, ports []uint32) *v3endpointpb.ClusterLoadAssignment {
+	var lbEndpoints []*v3endpointpb.LbEndpoint
+	for _, port := range ports {
+		lbEndpoints = append(lbEndpoints, &v3endpointpb.LbEndpoint{
+			HostIdentifier: &v3endpointpb.LbEndpoint_Endpoint{Endpoint: &v3endpointpb.Endpoint{
+				Address: &v3corepb.Address{Address: &v3corepb.Address_SocketAddress{
+					SocketAddress: &v3corepb.SocketAddress{
+						Protocol:      v3corepb.SocketAddress_TCP,
+						Address:       host,
+						PortSpecifier: &v3corepb.SocketAddress_PortValue{PortValue: port}},
+				}},
+			}},
+		})
+	}
 	return &v3endpointpb.ClusterLoadAssignment{
 		ClusterName: clusterName,
 		Endpoints: []*v3endpointpb.LocalityLbEndpoints{{
-			Locality: &v3corepb.Locality{SubZone: "subzone"},
-			LbEndpoints: []*v3endpointpb.LbEndpoint{{
-				HostIdentifier: &v3endpointpb.LbEndpoint_Endpoint{Endpoint: &v3endpointpb.Endpoint{
-					Address: &v3corepb.Address{Address: &v3corepb.Address_SocketAddress{
-						SocketAddress: &v3corepb.SocketAddress{
-							Protocol:      v3corepb.SocketAddress_TCP,
-							Address:       host,
-							PortSpecifier: &v3corepb.SocketAddress_PortValue{PortValue: uint32(port)}},
-					}},
-				}},
-			}},
+			Locality:            &v3corepb.Locality{SubZone: "subzone"},
+			LbEndpoints:         lbEndpoints,
 			LoadBalancingWeight: &wrapperspb.UInt32Value{Value: 1},
 			Priority:            0,
 		}},
